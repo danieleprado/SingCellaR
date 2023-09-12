@@ -1,3 +1,258 @@
+RPL_identifyDifferentialGenes_in_multiple_clusters_vs_the_rest_of_clusters <- function(object,cluster.ids=c(),
+                                                                                   method=c("wilcoxon"),
+                                                                                   cluster.type=c("louvain","kmeans","merged_walktrap","merged_louvain","merged_kmeans"),
+                                                                                   min.log2FC=0.25,min.expFraction=0.3,write.to.file=""){
+  
+  if(!is(object,"SingCellaR")){
+    stop("Need to initialize the SingCellaR object")
+  }
+  if(length(cluster.ids)==0){
+    stop("Please input cluster id of interest (e.g. cluster.ids=c('cl1','cl2')")
+  }
+  
+  clusters.info<-get_clusters(object)
+  cluster.type <- match.arg(cluster.type)
+  
+  if(cluster.type=="louvain"){
+    clusters.info<-clusters.info[,c("Cell","louvain_cluster")]
+  }else if(cluster.type=="kmeans"){
+    clusters.info<-get_knn_graph.kmeans.cluster(object)
+  }else if(cluster.type=="merged_walktrap"){
+    clusters.info<-clusters.info[,c("Cell","merged_walktrap")]
+  }else if(cluster.type=="merged_louvain"){
+    clusters.info<-clusters.info[,c("Cell","merged_louvain")]
+  }else if(cluster.type=="merged_kmeans"){
+    clusters.info<-get_knn_graph.kmeans.cluster(object)[,c("Cell","merged_kmeans")]
+  }else{
+    stop("Need a clustering-method name!")
+  }
+  #######################################
+  umi.dat<-get_normalized_umi(object)
+  genes.info<-get_genes_metadata(object)
+  genes.info<-subset(genes.info,IsExpress==TRUE)
+  umi.dat<-umi.dat[rownames(umi.dat) %in% rownames(genes.info),]
+  #########################
+  start.message<-paste("Identifying differentially expressed genes for:",toString(cluster.ids))
+  print(start.message)  
+  
+  cells <- get_cells_annotation(DBA)
+  RPL.cells <- character(0)
+  RPL.cells <- as.character(cells$Cell[cells$genotype == "RPL"])
+  # cols.RPL<-clusters.info$Cell[clusters.info[,1] %in% RPL.cells==T] # Testing purposes only
+
+  cols.A<-clusters.info$Cell[clusters.info[,2] %in% cluster.ids==T & clusters.info[,1] %in% RPL.cells==T]
+  cols.B<-clusters.info$Cell[clusters.info[,2] %in% cluster.ids==F & clusters.info[,1] %in% RPL.cells==T]
+  
+  cellsA.m<-umi.dat[,colnames(umi.dat) %in% cols.A]
+  cellsB.m<-umi.dat[,colnames(umi.dat) %in% cols.B]
+  
+  if(method=="wilcoxon"){
+    
+    cellsA.bi<-makeBinaryMatrix_for_float(cellsA.m)
+    #cellsA.bi[cellsA.bi > 0]<-1
+    A.freq<-Matrix::rowSums(cellsA.bi)
+    
+    cellsB.bi<-makeBinaryMatrix_for_float(cellsB.m)
+    #cellsB.bi[cellsB.bi > 0]<-1
+    B.freq<-Matrix::rowSums(cellsB.bi)
+    
+    
+    MeanA<-Matrix::rowMeans(cellsA.m)
+    MeanB<-Matrix::rowMeans(cellsB.m)
+    Foldchange<-MeanA/MeanB
+    
+    ExpFractionA=A.freq/ncol(cellsA.m)
+    ExpFractionB=B.freq/ncol(cellsB.m)
+    
+    z0<-data.frame(Gene=rownames(cellsA.m),
+                   ExpA=MeanA,
+                   ExpB=MeanB,
+                   FoldChange=Foldchange,
+                   log2FC=log2(Foldchange),
+                   ExpFreqA=A.freq,
+                   ExpFreqB=B.freq,
+                   TotalA=ncol(cellsA.m),
+                   TotalB=ncol(cellsB.m),
+                   ExpFractionA=ExpFractionA,
+                   ExpFractionB=ExpFractionB)
+    
+    z0<-subset(z0,ExpFractionA >=min.expFraction | ExpFractionB >=min.expFraction)
+    z0<-subset(z0,abs(log2FC) >=min.log2FC)
+    
+    cont.t<-data.frame(x1=z0$ExpFreqA,x2=ncol(cellsA.m)-z0$ExpFreqA,y1=z0$ExpFreqB,y2=ncol(cellsB.m)-z0$ExpFreqB)
+    print("Processing Fisher's exact test!")
+    fishers.p = pbsapply (1:nrow(cont.t),
+                          function (x) fisher.test(matrix(c(cont.t[x,1],
+                                                            cont.t[x,2],
+                                                            cont.t[x,3],
+                                                            cont.t[x,4]),
+                                                          nrow=2
+                          ))$p.value
+    )
+    z0$fishers.pval<-fishers.p
+    z0<-subset(z0,fishers.pval < 0.1)
+    
+    cellsA.f.m<-cellsA.m[rownames(cellsA.m) %in% as.character(z0$Gene),]
+    cellsB.f.m<-cellsB.m[rownames(cellsB.m) %in% as.character(z0$Gene),]
+    cellsA.f.m<-log1p(cellsA.f.m)
+    cellsB.f.m<-log1p(cellsB.f.m)
+    
+    print("Processing Wilcoxon Rank-sum test!")
+    wilcoxon.p = pbsapply (1:nrow(cellsA.f.m),
+                           function (x) wilcox.test(cellsA.f.m[x,],cellsB.f.m[x,])$p.value
+    )
+    z0$wilcoxon.pval<-wilcoxon.p
+    
+    fishersMethod <-function(x) pchisq(-2 * sum(log(x)),df=2*length(x),lower.tail=FALSE)
+    print("Combining p-values using the fisher's method!")
+    combined.pvalues = pbsapply (1:nrow(z0),
+                                 function (x) fishersMethod(c(z0[x,12],z0[x,13]))
+    )
+    z0$combined.pval<-combined.pvalues
+    z0$adjusted.pval<-p.adjust(z0$combined.pval,method = "BH")
+    z0<-z0[order(z0$adjusted.pval),]
+    #####write to a file############
+    if(write.to.file!=""){
+      write.table(z0,file=write.to.file,
+                  append=FALSE, sep="\t", quote=FALSE,row.names=FALSE, col.names=TRUE)
+    }
+    ################################
+    return(z0)
+  }else{
+    stop("Please input the statistical method name!.")
+  }
+}
+
+###################################################################################################################################################################
+
+RPS_identifyDifferentialGenes_in_multiple_clusters_vs_the_rest_of_clusters <- function(object,cluster.ids=c(),
+                                                                                   method=c("wilcoxon"),
+                                                                                   cluster.type=c("louvain","kmeans","merged_walktrap","merged_louvain","merged_kmeans"),
+                                                                                   min.log2FC=0.25,min.expFraction=0.3,write.to.file=""){
+  
+  if(!is(object,"SingCellaR")){
+    stop("Need to initialize the SingCellaR object")
+  }
+  if(length(cluster.ids)==0){
+    stop("Please input cluster id of interest (e.g. cluster.ids=c('cl1','cl2')")
+  }
+  
+  clusters.info<-get_clusters(object)
+  cluster.type <- match.arg(cluster.type)
+  
+  if(cluster.type=="louvain"){
+    clusters.info<-clusters.info[,c("Cell","louvain_cluster")]
+  }else if(cluster.type=="kmeans"){
+    clusters.info<-get_knn_graph.kmeans.cluster(object)
+  }else if(cluster.type=="merged_walktrap"){
+    clusters.info<-clusters.info[,c("Cell","merged_walktrap")]
+  }else if(cluster.type=="merged_louvain"){
+    clusters.info<-clusters.info[,c("Cell","merged_louvain")]
+  }else if(cluster.type=="merged_kmeans"){
+    clusters.info<-get_knn_graph.kmeans.cluster(object)[,c("Cell","merged_kmeans")]
+  }else{
+    stop("Need a clustering-method name!")
+  }
+  #######################################
+  umi.dat<-get_normalized_umi(object)
+  genes.info<-get_genes_metadata(object)
+  genes.info<-subset(genes.info,IsExpress==TRUE)
+  umi.dat<-umi.dat[rownames(umi.dat) %in% rownames(genes.info),]
+  #########################
+  start.message<-paste("Identifying differentially expressed genes for:",toString(cluster.ids))
+  print(start.message)  
+  
+  cells <- get_cells_annotation(DBA)
+  RPS.cells <- character(0)
+  RPS.cells <- as.character(cells$Cell[cells$genotype == "RPS"])
+  #cols.RPS<-clusters.info$Cell[clusters.info[,1] %in% RPS.cells==T]
+  
+  cols.A<-clusters.info$Cell[clusters.info[,2] %in% cluster.ids==T & clusters.info[,1] %in% RPS.cells==T]
+  cols.B<-clusters.info$Cell[clusters.info[,2] %in% cluster.ids==F & clusters.info[,1] %in% RPS.cells==T]
+  
+  cellsA.m<-umi.dat[,colnames(umi.dat) %in% cols.A]
+  cellsB.m<-umi.dat[,colnames(umi.dat) %in% cols.B]
+  
+  if(method=="wilcoxon"){
+    
+    cellsA.bi<-makeBinaryMatrix_for_float(cellsA.m)
+    #cellsA.bi[cellsA.bi > 0]<-1
+    A.freq<-Matrix::rowSums(cellsA.bi)
+    
+    cellsB.bi<-makeBinaryMatrix_for_float(cellsB.m)
+    #cellsB.bi[cellsB.bi > 0]<-1
+    B.freq<-Matrix::rowSums(cellsB.bi)
+    
+    
+    MeanA<-Matrix::rowMeans(cellsA.m)
+    MeanB<-Matrix::rowMeans(cellsB.m)
+    Foldchange<-MeanA/MeanB
+    
+    ExpFractionA=A.freq/ncol(cellsA.m)
+    ExpFractionB=B.freq/ncol(cellsB.m)
+    
+    z0<-data.frame(Gene=rownames(cellsA.m),
+                   ExpA=MeanA,
+                   ExpB=MeanB,
+                   FoldChange=Foldchange,
+                   log2FC=log2(Foldchange),
+                   ExpFreqA=A.freq,
+                   ExpFreqB=B.freq,
+                   TotalA=ncol(cellsA.m),
+                   TotalB=ncol(cellsB.m),
+                   ExpFractionA=ExpFractionA,
+                   ExpFractionB=ExpFractionB)
+    
+    z0<-subset(z0,ExpFractionA >=min.expFraction | ExpFractionB >=min.expFraction)
+    z0<-subset(z0,abs(log2FC) >=min.log2FC)
+    
+    cont.t<-data.frame(x1=z0$ExpFreqA,x2=ncol(cellsA.m)-z0$ExpFreqA,y1=z0$ExpFreqB,y2=ncol(cellsB.m)-z0$ExpFreqB)
+    print("Processing Fisher's exact test!")
+    fishers.p = pbsapply (1:nrow(cont.t),
+                          function (x) fisher.test(matrix(c(cont.t[x,1],
+                                                            cont.t[x,2],
+                                                            cont.t[x,3],
+                                                            cont.t[x,4]),
+                                                          nrow=2
+                          ))$p.value
+    )
+    z0$fishers.pval<-fishers.p
+    z0<-subset(z0,fishers.pval < 0.1)
+    
+    cellsA.f.m<-cellsA.m[rownames(cellsA.m) %in% as.character(z0$Gene),]
+    cellsB.f.m<-cellsB.m[rownames(cellsB.m) %in% as.character(z0$Gene),]
+    cellsA.f.m<-log1p(cellsA.f.m)
+    cellsB.f.m<-log1p(cellsB.f.m)
+    
+    print("Processing Wilcoxon Rank-sum test!")
+    wilcoxon.p = pbsapply (1:nrow(cellsA.f.m),
+                           function (x) wilcox.test(cellsA.f.m[x,],cellsB.f.m[x,])$p.value
+    )
+    z0$wilcoxon.pval<-wilcoxon.p
+    
+    fishersMethod <-function(x) pchisq(-2 * sum(log(x)),df=2*length(x),lower.tail=FALSE)
+    print("Combining p-values using the fisher's method!")
+    combined.pvalues = pbsapply (1:nrow(z0),
+                                 function (x) fishersMethod(c(z0[x,12],z0[x,13]))
+    )
+    z0$combined.pval<-combined.pvalues
+    z0$adjusted.pval<-p.adjust(z0$combined.pval,method = "BH")
+    z0<-z0[order(z0$adjusted.pval),]
+    #####write to a file############
+    if(write.to.file!=""){
+      write.table(z0,file=write.to.file,
+                  append=FALSE, sep="\t", quote=FALSE,row.names=FALSE, col.names=TRUE)
+    }
+    ################################
+    return(z0)
+  }else{
+    stop("Please input the statistical method name!.")
+  }
+}
+
+###################################################################################################################################################################
+
+
 #' Load 10X sparse data matrices provided by the Cell Ranger software
 #' @param  object The SingCellaR object.
 #' @param  cellranger.version is the version of the Cell Ranger software used to generate input matrices.
